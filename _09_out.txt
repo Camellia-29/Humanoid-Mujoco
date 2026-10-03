@@ -1,0 +1,73 @@
+Script 09 ¡ª Why ctrl=0 does not stand the robot up
+============================================================
+Watch the viewer; three demos in sequence.
+
+
+--- Demo A: ctrl = all zeros       (gravity alone) ---
+      t   torso z
+   0.00     1.400
+   0.30     1.277
+   0.60     0.990
+   0.90     0.421
+   1.21     0.078
+   1.51     0.079
+   1.81     0.079
+   2.11     0.079
+   2.41     0.079
+   2.71     0.079
+  -> FELL at t = 0.72s
+
+--- Demo B: ctrl = constant -0.1 on knees (mild squat) ---
+      t   torso z
+   0.00     1.400
+   0.30     0.838
+   0.60     0.609
+   0.90     0.262
+   1.21     0.079
+   1.51     0.079
+   1.81     0.079
+   2.11     0.079
+   2.41     0.088
+   2.71     0.082
+   3.02     0.080
+   3.32     0.080
+   3.62     0.080
+   3.92     0.080
+   4.22     0.081
+   4.52     0.081
+   4.82     0.081
+  -> FELL at t = 0.55s
+
+--- Demo C: ctrl = constant -0.3 on knees (deep squat) ---
+      t   torso z
+   0.00     1.400
+   0.30     0.844
+   0.60     0.622
+   0.90     0.401
+   1.21     0.078
+   1.51     0.079
+   1.81     0.079
+   2.11     0.079
+   2.41     0.079
+   2.71     0.079
+   3.02     0.079
+   3.32     0.079
+   3.62     0.079
+   3.92     0.079
+   4.22     0.080
+   4.52     0.080
+   4.82     0.081
+  -> FELL at t = 0.55s
+
+============================================================
+Summary:  zero       lasted 0.72s  (fell)
+          knee -0.1  lasted 0.55s  (fell)
+          knee -0.3  lasted 0.55s  (fell)
+
+Reading guide:
+  Demo A: no torque -> gravity is unopposed -> falls in <0.5 s
+  Demo B/C: constant knee torque -> small pre-load on the spring-like
+            joints -> falls a bit later, but no FEEDBACK to recover
+            from disturbances. Open-loop control cannot balance.
+
+  Next: script 10_pd_controller.py adds the missing FEEDBACK term.
