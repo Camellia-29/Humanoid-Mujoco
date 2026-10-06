@@ -88,12 +88,12 @@ def compute_ctrl(t):
         if is_stance:
             # 支撑相：膝盖接近 0（因为站立 keyframe 腿是直的）
             # 髋从前往后摆：s=0 时前摆，s=1 时后摆
-            hip_p = AMP_HIP_P * np.cos(np.pi * s)   # +AMP -> -AMP
+            hip_p = -AMP_HIP_P * np.cos(np.pi * s)   # +AMP -> -AMP
             knee = 0.02                              # 几乎伸直
             ankle_p = -0.5 * hip_p                   # 保持脚掌水平
         else:
             # 摆动相：膝盖弯曲让脚离地，髋从后往前摆
-            hip_p = -AMP_HIP_P * np.cos(np.pi * s)  # -AMP -> +AMP
+            hip_p = AMP_HIP_P * np.cos(np.pi * s)  # -AMP -> +AMP
             knee = AMP_KNEE_SWING * np.sin(np.pi * s)
             ankle_p = AMP_ANKLE_P * np.sin(np.pi * s)
 
