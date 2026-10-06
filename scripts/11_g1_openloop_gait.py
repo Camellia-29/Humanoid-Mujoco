@@ -4,20 +4,26 @@ import numpy as np
 import time
 from pathlib import Path
 
+# ===================== 路径与参数 =====================
 MODEL_PATH = Path(__file__).resolve().parent.parent / "models" / "g1.xml"
 
-# === Gait parameters (tune these) ===
-GAIT_FREQ = 1.5          # Hz, steps per second
-AMP_HIP_P = 0.35         # hip pitch amplitude (rad)
-AMP_HIP_Y = 0.15         # hip yaw amplitude (rad)
-AMP_KNEE = 0.40          # knee amplitude (rad)
-AMP_ANKLE_P = 0.15       # ankle pitch amplitude (rad)
-AMP_ANKLE_R = 0.05       # ankle roll amplitude (rad)
-AMP_WAIST_Y = 0.10       # waist yaw amplitude (rad)
-AMP_ARM = 0.30           # arm swing amplitude (rad)
-PHASE_OFFSET = np.pi     # left/right phase offset
+GAIT_FREQ = 0.8          # 步态频率 Hz
+AMP_HIP_P = 0.30         # 髋关节前后摆幅 (rad)
+AMP_KNEE_SWING = 0.80    # 摆动相膝盖弯曲幅值 (rad)
+AMP_ANKLE_P = 0.20       # 踝关节俯仰幅值 (rad)
+AMP_ARM = 0.25           # 手臂摆动幅值 (rad)
+AMP_WAIST_ROLL = 0.03    # 腰部 roll 幅值 (rad)
 
-# === Build actuator name -> index map ===
+# 支撑/摆动相占空比：支撑相占 60%
+STANCE_RATIO = 0.6
+
+# 足底相对 site 的偏移（你的模型脚底在 site 下方约 0.03 m）
+FOOT_OFFSET_Z = 0.03
+
+AUTO_RESET = False
+
+
+# ===================== 工具函数 =====================
 def build_act_map(model):
     act_map = {}
     for i in range(model.nu):
@@ -27,7 +33,7 @@ def build_act_map(model):
         act_map[name] = i
     return act_map
 
-# === Get stand qpos from keyframe ===
+
 def get_stand_qpos(model):
     for i in range(model.nkey):
         kn = model.key(i).name
@@ -37,7 +43,8 @@ def get_stand_qpos(model):
             return model.key(i).qpos.copy()
     return model.key(0).qpos.copy()
 
-# === Main ===
+
+# ===================== 加载模型 =====================
 model = mujoco.MjModel.from_xml_path(str(MODEL_PATH))
 data = mujoco.MjData(model)
 act_map = build_act_map(model)
@@ -47,53 +54,82 @@ pelvis_id = model.body("pelvis").id
 print("Actuator map keys:", sorted(act_map.keys()))
 print(f"Stand qpos len={len(stand_qpos)}, nu={model.nu}")
 
-# Verify critical actuators exist
-for key in ["left_hip_pitch_joint", "right_hip_pitch_joint", "left_knee_joint", "right_knee_joint",
-            "left_ankle_pitch_joint", "right_ankle_pitch_joint", "waist_yaw_joint",
-            "left_shoulder_pitch_joint", "right_shoulder_pitch_joint"]:
+required_keys = [
+    "left_hip_pitch_joint", "right_hip_pitch_joint",
+    "left_knee_joint", "right_knee_joint",
+    "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+    "waist_yaw_joint", "waist_pitch_joint", "waist_roll_joint",
+    "left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
+]
+for key in required_keys:
     assert key in act_map, f"Missing actuator: {key}"
+
+
+# ===================== 步态生成 =====================
+def leg_phase(p):
+    """输入相位 p，返回 (是否支撑相, 相位内进度 0~1)"""
+    p = np.mod(p, 2 * np.pi)
+    stance_end = STANCE_RATIO * 2 * np.pi
+    if p < stance_end:
+        return True, p / stance_end
+    else:
+        return False, (p - stance_end) / (2 * np.pi - stance_end)
+
 
 def compute_ctrl(t):
     phase = 2 * np.pi * GAIT_FREQ * t
     ctrl = np.zeros(model.nu)
 
-    # Legs
-    for side, sign in [("left", 1), ("right", -1)]:
-        p = phase + (PHASE_OFFSET if sign < 0 else 0)
-        hip_p = sign * AMP_HIP_P * np.sin(p)
-        hip_y = AMP_HIP_Y * np.sin(p)
-        knee = AMP_KNEE * (1 - np.cos(p)) * 0.5
-        ankle_p = sign * AMP_ANKLE_P * np.sin(p)
-        ankle_r = AMP_ANKLE_R * np.cos(p * 2)
+    # ---------- 腿部 ----------
+    for side, phase_offset in [("left", 0.0), ("right", np.pi)]:
+        p = phase + phase_offset
+        is_stance, s = leg_phase(p)
+
+        if is_stance:
+            # 支撑相：膝盖接近 0（因为站立 keyframe 腿是直的）
+            # 髋从前往后摆：s=0 时前摆，s=1 时后摆
+            hip_p = AMP_HIP_P * np.cos(np.pi * s)   # +AMP -> -AMP
+            knee = 0.02                              # 几乎伸直
+            ankle_p = -0.5 * hip_p                   # 保持脚掌水平
+        else:
+            # 摆动相：膝盖弯曲让脚离地，髋从后往前摆
+            hip_p = -AMP_HIP_P * np.cos(np.pi * s)  # -AMP -> +AMP
+            knee = AMP_KNEE_SWING * np.sin(np.pi * s)
+            ankle_p = AMP_ANKLE_P * np.sin(np.pi * s)
 
         ctrl[act_map[f"{side}_hip_pitch_joint"]] = hip_p
-        ctrl[act_map[f"{side}_hip_yaw_joint"]] = hip_y
         ctrl[act_map[f"{side}_knee_joint"]] = knee
         ctrl[act_map[f"{side}_ankle_pitch_joint"]] = ankle_p
-        ctrl[act_map[f"{side}_ankle_roll_joint"]] = ankle_r
 
-    # Waist
-    ctrl[act_map["waist_yaw_joint"]] = AMP_WAIST_Y * np.sin(phase)
+    # ---------- 腰部：左右重心转移 ----------
+    # 左腿支撑时（phase 在支撑相），重心偏左，waist_roll 给一个小角度
+    ctrl[act_map["waist_roll_joint"]] = AMP_WAIST_ROLL * np.sin(phase)
+    ctrl[act_map["waist_yaw_joint"]] = 0.0
+    ctrl[act_map["waist_pitch_joint"]] = 0.0
 
-    # Arms (opposite to legs)
-    for side, sign in [("left", 1), ("right", -1)]:
-        p = phase + (PHASE_OFFSET if sign < 0 else 0) + np.pi
-        shoulder_p = sign * AMP_ARM * np.sin(p)
-        ctrl[act_map[f"{side}_shoulder_pitch_joint"]] = shoulder_p
+    # ---------- 手臂：与对侧腿同相 ----------
+    for side, phase_offset in [("left", np.pi), ("right", 0.0)]:
+        p = phase + phase_offset
+        ctrl[act_map[f"{side}_shoulder_pitch_joint"]] = AMP_ARM * np.sin(p)
 
     return ctrl
 
-# Reset to stand
+
+# ===================== 初始化 =====================
 data.qpos[:] = stand_qpos
+data.qvel[:] = 0
+data.ctrl[:] = 0
 mujoco.mj_forward(model, data)
 
 fallen = False
+
+
 def check_fallen():
     global fallen
-    up = np.array([0, 0, 1])
     z_axis = data.xmat[pelvis_id][6:9]
-    if np.dot(z_axis, up) < 0.3:
+    if z_axis[2] < 0.3:
         fallen = True
+
 
 def reset():
     global fallen
@@ -103,19 +139,38 @@ def reset():
     mujoco.mj_forward(model, data)
     fallen = False
 
-t0 = time.time()
+
+# ===================== 主循环 =====================
+print("开始仿真。按 ESC 或关闭窗口退出。")
 with mujoco.viewer.launch_passive(model, data) as viewer:
-    viewer.cam.distance = 3.0
+    viewer.cam.distance = 2.5
+    viewer.cam.elevation = -15
+    viewer.cam.azimuth = 90
+
+    last_print = -1.0
     while viewer.is_running():
-        t = time.time() - t0
-        if fallen:
+        t = data.time
+
+        if AUTO_RESET and fallen:
             reset()
-            t0 = time.time()
-            t = 0
+            t = 0.0
 
         data.ctrl[:] = compute_ctrl(t)
         mujoco.mj_step(model, data)
         check_fallen()
+
+        # 每秒打印一次足底高度和骨盆高度
+        if data.time - last_print >= 1.0:
+            last_print = data.time
+            try:
+                lf = data.site("left_foot").xpos
+                rf = data.site("right_foot").xpos
+                lf_z = lf[2] - FOOT_OFFSET_Z
+                rf_z = rf[2] - FOOT_OFFSET_Z
+                pz = data.xpos[pelvis_id][2]
+                print(f"t={data.time:5.2f}  L_foot_z={lf_z:+.3f}  R_foot_z={rf_z:+.3f}  pelvis_z={pz:.3f}")
+            except Exception as e:
+                print("print error:", e)
 
         with viewer.lock():
             viewer.cam.lookat[:] = data.xpos[pelvis_id]
