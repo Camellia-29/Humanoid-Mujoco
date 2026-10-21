@@ -1,7 +1,7 @@
 # --- Core physics + RL interface (already in .venv) ---
 gymnasium[mujoco]==1.3.0
 mujoco==3.1.6
-numpy==2.5.3
+numpy>=1.24,<3.0
 
 # --- Deep learning + RL algorithms (to be installed) ---
 # CPU-only torch (no NVIDIA GPU detected on this machine).
