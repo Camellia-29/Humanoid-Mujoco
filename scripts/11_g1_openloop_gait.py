@@ -22,6 +22,8 @@ FOOT_OFFSET_Z = 0.03
 
 AUTO_RESET = False
 
+SIM_DURATION = 10.0  # 仿真时长（秒），自己改
+
 
 # ===================== 工具函数 =====================
 def build_act_map(model):
@@ -140,40 +142,42 @@ def reset():
     fallen = False
 
 
-# ===================== 主循环 =====================
-print("开始仿真。按 ESC 或关闭窗口退出。")
-with mujoco.viewer.launch_passive(model, data) as viewer:
-    viewer.cam.distance = 2.5
-    viewer.cam.elevation = -15
-    viewer.cam.azimuth = 90
+# ===================== 主循环（headless）=====================
+print(f"开始仿真（headless 模式），跑 {SIM_DURATION:.1f} 秒...")
 
-    last_print = -1.0
-    while viewer.is_running():
-        t = data.time
+last_print = -1.0
+t_start = time.time()
 
-        if AUTO_RESET and fallen:
-            reset()
-            t = 0.0
+while data.time < SIM_DURATION:
+    t = data.time
 
-        data.ctrl[:] = compute_ctrl(t)
-        mujoco.mj_step(model, data)
-        check_fallen()
+    if AUTO_RESET and fallen:
+        reset()
+        t = 0.0
 
-        # 每秒打印一次足底高度和骨盆高度
-        if data.time - last_print >= 1.0:
-            last_print = data.time
-            try:
-                lf = data.site("left_foot").xpos
-                rf = data.site("right_foot").xpos
-                lf_z = lf[2] - FOOT_OFFSET_Z
-                rf_z = rf[2] - FOOT_OFFSET_Z
-                pz = data.xpos[pelvis_id][2]
-                print(f"t={data.time:5.2f}  L_foot_z={lf_z:+.3f}  R_foot_z={rf_z:+.3f}  pelvis_z={pz:.3f}")
-            except Exception as e:
-                print("print error:", e)
+    data.ctrl[:] = compute_ctrl(t)
+    mujoco.mj_step(model, data)
+    check_fallen()
 
-        with viewer.lock():
-            viewer.cam.lookat[:] = data.xpos[pelvis_id]
-            viewer.sync()
+    if fallen:
+        print(f"t={t:.2f}  ⚠ 跌倒！")
+        if not AUTO_RESET:
+            break
 
-        time.sleep(model.opt.timestep)
+    # 每秒打印一次足底高度和骨盆高度
+    if data.time - last_print >= 1.0:
+        last_print = data.time
+        try:
+            lf = data.site("left_foot").xpos
+            rf = data.site("right_foot").xpos
+            lf_z = lf[2] - FOOT_OFFSET_Z
+            rf_z = rf[2] - FOOT_OFFSET_Z
+            pz = data.xpos[pelvis_id][2]
+            print(f"t={data.time:5.2f}  L_foot_z={lf_z:+.3f}  R_foot_z={rf_z:+.3f}  pelvis_z={pz:.3f}")
+        except Exception as e:
+            print("print error:", e)
+
+    time.sleep(model.opt.timestep)
+
+elapsed = time.time() - t_start
+print(f"仿真结束，仿真时间={data.time:.2f}s, 实际耗时={elapsed:.2f}s, 速度比={data.time/elapsed:.1f}x")
