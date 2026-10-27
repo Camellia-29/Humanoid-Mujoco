@@ -10,12 +10,11 @@ class G1WalkEnv(gym.Env):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         xml_path = os.path.join(current_dir, "../models/g1.xml")
 
-        # g1.xml 不包含 ground plane；环境加载时注入地面，避免训练中永久无脚部接触
         with open(xml_path, "r", encoding="utf-8") as xml_file:
             xml_text = xml_file.read()
         xml_text = xml_text.replace(
             "<worldbody>",
-            '<worldbody>\n    <geom name="ground" type="plane" size="10 10 0.1" rgba="0.9 0.9 0.9 1"/>',
+            '<worldbody>\n    <geom name="ground" type="plane" size="20 20 0.1" rgba="0.9 0.9 0.9 1"/>',
             1,
         )
         model_dir = os.path.dirname(xml_path)
@@ -30,26 +29,30 @@ class G1WalkEnv(gym.Env):
         self.num_actions = self.model.nu
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_actions,), dtype=np.float32)
 
-        # 观测空间保持不变
-        self.num_obs = 4 + 3 + 3 + (self.model.nq - 7) + (self.model.nv - 6) + 3 + 2
+        # 观测里加入：基础状态 + 速度指令(3) + 脚高(2) + sin/cos相位(2) 
+        self.num_obs = 4 + 3 + 3 + (self.model.nq - 7) + (self.model.nv - 6) + 3 + 2 + 2
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(self.num_obs,), dtype=np.float32)
 
         self.root_body_id = 1 
         self.joint_qpos_indices = np.arange(7, self.model.nq)
         self.joint_qvel_indices = np.arange(6, self.model.nv)
 
-        self.target_height = 0.793
+        self.target_height = 0.78 
         self.stand_key_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_KEY, "stand")
         if self.stand_key_id >= 0:
             self.stand_ctrl = self.model.key_ctrl[self.stand_key_id].copy()
         else:
             self.stand_ctrl = np.zeros(self.model.nu, dtype=np.float32)
             
-        self.action_scale = np.full(self.model.nu, 0.15, dtype=np.float32)
-        self.target_speed = 0.25
+        # 使用官方推荐的 action_scale
+        self.action_scale = np.full(self.model.nu, 0.25, dtype=np.float32)
+        
+        self.commands = np.array([0.8, 0.0, 0.0], dtype=np.float32)
         
         self.left_foot_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "left_foot")
         self.right_foot_site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "right_foot")
+        
+        self.dt = 0.02 # 50Hz
 
     def _get_obs(self):
         root_quat = self.data.qpos[3:7]
@@ -63,51 +66,79 @@ class G1WalkEnv(gym.Env):
         
         gravity_in_body = self.data.xmat[self.root_body_id].reshape(3,3).T @ np.array([0, 0, -9.81])
         
+        # 【官方核心 1：相位变量】
+        phase = (self.step_counter * self.dt) % 0.8 / 0.8
+        sin_phase = np.sin(2 * np.pi * phase)
+        cos_phase = np.cos(2 * np.pi * phase)
+        
         extras = np.array([left_foot_z, right_foot_z], dtype=np.float32)
         
         return np.concatenate([
             root_quat, root_linvel, root_angvel,
             joint_pos, joint_vel,
-            gravity_in_body, extras
+            gravity_in_body, extras, self.commands,
+            [sin_phase, cos_phase]
         ]).astype(np.float32)
 
     def _compute_reward(self):
+        # 1. 跟踪线速度 (命令跟踪)
+        lin_vel_error = np.sum(np.square(self.commands[:2] - self.data.qvel[:2]))
+        tracking_lin_vel = np.exp(-lin_vel_error / 0.25) * 1.0
+        
+        # 2. 跟踪角速度
+        ang_vel_error = np.square(self.commands[2] - self.data.qvel[5])
+        tracking_ang_vel = np.exp(-ang_vel_error / 0.25) * 0.5
+        
+        # 3. 姿态惩罚
+        upright = self.data.xmat[self.root_body_id][8]
+        orientation = -1.0 * max(0.0, 0.8 - upright) 
+        
+        # 4. 高度惩罚
         torso_z = self.data.xpos[self.root_body_id][2]
-        upright = self.data.xmat[self.root_body_id][8]  # 保持身体直立
+        base_height = -10.0 * np.square(torso_z - self.target_height)
         
-        # 1. 先让策略优先学会维持站立姿态
-        alive_bonus = 1.0 * max(0.0, upright)
-        height_reward = 2.0 * np.exp(-10.0 * (torso_z - self.target_height)**2)
-        posture_reward = 2.0 * max(0.0, upright)
-
-        # 2. 使用较低的初始目标速度，避免策略一开始就追求大步幅
-        forward_vel = self.data.qvel[0] # x 轴速度
-        vel_reward = 6.0 * np.exp(-20.0 * (forward_vel - self.target_speed) ** 2)
-
-        # 3. 惩罚项
-        ctrl_error = self.data.ctrl - self.stand_ctrl
-        ctrl_penalty = -0.001 * np.sum(np.square(ctrl_error))
+        # 5. 基础存活
+        alive = 0.15
         
-        # 惩罚横向漂移(y轴)和剧烈旋转，逼它走直线
-        side_vel_penalty = -0.5 * np.square(self.data.qvel[1])
-        ang_vel_penalty = -0.1 * np.sum(np.square(self.data.qvel[3:6]))
+        # 【官方核心 2：相位接触奖励】
+        phase = (self.step_counter * self.dt) % 0.8 / 0.8
+        phase_left = phase
+        phase_right = (phase + 0.5) % 1.0
         
-        # 抑制关节抽风
-        joint_vel_penalty = -0.0005 * np.sum(np.square(self.data.qvel[self.joint_qvel_indices]))
+        left_foot_z = self.data.site_xpos[self.left_foot_site_id, 2]
+        right_foot_z = self.data.site_xpos[self.right_foot_site_id, 2]
+        
+        left_contact = left_foot_z <= 0.03
+        right_contact = right_foot_z <= 0.03
+        
+        # 强制左脚在前 55% 时间踩地，右脚在后 55% 踩地
+        contact_reward = 0.0
+        if (phase_left < 0.55) == left_contact: contact_reward += 1.0
+        if (phase_right < 0.55) == right_contact: contact_reward += 1.0
+        contact_reward *= 0.18
+        
+        # 【官方核心 3：摆动高度奖励】
+        swing_height = 0.0
+        if not left_contact:
+            swing_height -= 20.0 * np.square(left_foot_z - 0.08)
+        if not right_contact:
+            swing_height -= 20.0 * np.square(right_foot_z - 0.08)
 
-        return (alive_bonus + height_reward + posture_reward + vel_reward 
-                + ctrl_penalty + side_vel_penalty + ang_vel_penalty + joint_vel_penalty)
+        # 其他惩罚
+        action_rate = -0.01 * np.sum(np.square(self.data.ctrl - self.stand_ctrl))
+        dof_vel = -1e-3 * np.sum(np.square(self.data.qvel[self.joint_qvel_indices]))
+        
+        reward = (tracking_lin_vel + tracking_ang_vel + orientation + base_height + alive + 
+                  contact_reward + swing_height + action_rate + dof_vel)
+                  
+        return reward
 
     def _check_done(self):
         torso_z = self.data.xpos[self.root_body_id][2]
         upright = self.data.xmat[self.root_body_id][8]
         
-        # 一旦摔倒或者过低就结束
-        if torso_z < 0.45:
-            return True
-        if upright < 0.5:
-            return True
-            
+        if torso_z < 0.4: return True
+        if upright < 0.4: return True
         return False
 
     def step(self, action):
@@ -120,27 +151,27 @@ class G1WalkEnv(gym.Env):
         for _ in range(4):
             mujoco.mj_step(self.model, self.data)
 
+        self.step_counter += 1
+
         obs = self._get_obs()
         reward = self._compute_reward()
         done = self._check_done()
-        info = {}
+        
         if done:
-            torso_z = self.data.xpos[self.root_body_id][2]
-            upright = self.data.xmat[self.root_body_id][8]
-            info["termination_reason"] = "height" if torso_z < 0.45 else "upright"
             reward -= 5.0
 
-        return obs, reward, done, False, info
+        return obs, reward, done, False, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
+        
+        self.step_counter = 0 # 重置相位计数器
         
         if self.stand_key_id >= 0:
             mujoco.mj_resetDataKeyframe(self.model, self.data, self.stand_key_id)
         else:
             mujoco.mj_resetData(self.model, self.data)
-            self.data.qpos[2] = 0.793
-            self.data.qpos[self.joint_qpos_indices] = 0.0
+            self.data.qpos[2] = 0.78
         
         self.data.ctrl[:] = self.stand_ctrl
         
