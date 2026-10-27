@@ -58,8 +58,8 @@ if __name__ == "__main__":
         name_prefix="clean_policy_ckpt"
     )
 
-    # 开始训练 (先跑 200 万步)
-    total_timesteps = 2_000_000
+    # 开始训练 
+    total_timesteps = 500_000
     print(f"=== 开始训练 G1 干净基线，总步数: {total_timesteps} ===")
     model.learn(
         total_timesteps=total_timesteps,

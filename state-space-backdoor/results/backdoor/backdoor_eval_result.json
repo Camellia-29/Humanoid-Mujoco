@@ -1,0 +1,13 @@
+{
+  "clean": {
+    "avg_episode_length": 465.0,
+    "avg_reward": 4154.85,
+    "clean_success_rate": 90.0
+  },
+  "triggered": {
+    "avg_episode_length": 150.4,
+    "avg_reward": 1087.58,
+    "attack_success_rate": 100.0
+  },
+  "backdoor_effective": true
+}
